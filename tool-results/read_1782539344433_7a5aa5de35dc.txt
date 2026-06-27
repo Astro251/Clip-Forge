@@ -1,0 +1,1544 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+     4→     4→import {
+     5→     5→  Clapperboard,
+     6→     6→  UploadCloud,
+     7→     7→  FileVideo,
+     8→     8→  Music,
+     9→     9→  Plus,
+    10→    10→  Trash2,
+    11→    11→  Download,
+    12→    12→  Layers,
+    13→    13→  TerminalSquare,
+    14→    14→  Loader2,
+    15→    15→  X,
+    16→    16→  CheckCircle2,
+    17→    17→  AlertCircle,
+    18→    18→  Info,
+    19→    19→  Film,
+    20→    20→  Eraser,
+    21→    21→  FilmIcon,
+    22→    22→  Play,
+    23→    23→  Pause,
+    24→    24→  Square,
+    25→    25→  ListPlus,
+    26→    26→  ChevronDown,
+    27→    27→  ChevronUp,
+    28→    28→} from "lucide-react";
+    29→    29→import type { FFmpeg } from "@ffmpeg/ffmpeg";
+    30→    30→import { Timeline } from "@/components/timeline";
+    31→    31→import {
+    32→    32→  buildConcatCopyArgs,
+    33→    33→  buildConcatList,
+    34→    34→  buildConcatReencodeArgs,
+    35→    35→  buildCutArgs,
+    36→    36→  buildMp3Args,
+    37→    37→  createFFmpeg,
+    38→    38→  downloadBlob,
+    39→    39→  fetchFile,
+    40→    40→  formatBytes,
+    41→    41→  formatDurationMs,
+    42→    42→  formatTime,
+    43→    43→  formatTimeShort,
+    44→    44→  getExtension,
+    45→    45→  getSourceDuration,
+    46→    46→  parseBulkTimestamps,
+    47→    47→  parseTimestamp,
+    48→    48→  sanitizeFilename,
+    49→    49→  stripExtension,
+    50→    50→} from "@/lib/ffmpeg";
+    51→    51→import type { Clip } from "@/lib/types";
+    52→    52→
+    53→    53→/* ------------------------------------------------------------------ */
+    54→    54→/* Types                                                               */
+    55→    55→/* ------------------------------------------------------------------ */
+    56→    56→
+    57→    57→type FfmpegStatus = "idle" | "loading" | "ready";
+    58→    58→type LogType = "info" | "success" | "warn" | "error" | "muted";
+    59→    59→interface LogEntry {
+    60→    60→  id: number;
+    61→    61→  text: string;
+    62→    62→  type: LogType;
+    63→    63→}
+    64→    64→type ToastType = "info" | "success" | "error";
+    65→    65→interface Toast {
+    66→    66→  id: string;
+    67→    67→  message: string;
+    68→    68→  type: ToastType;
+    69→    69→}
+    70→    70→
+    71→    71→/* ------------------------------------------------------------------ */
+    72→    72→/* Helpers                                                             */
+    73→    73→/* ------------------------------------------------------------------ */
+    74→    74→
+    75→    75→const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    76→    76→
+    77→    77→/** Generate a stable unique id with a fallback when crypto.randomUUID is absent. */
+    78→    78→function generateId(): string {
+    79→    79→  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    80→    80→    return crypto.randomUUID();
+    81→    81→  }
+    82→    82→  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    83→    83→}
+    84→    84→
+    85→    85→/** Filter out the noisy per-frame progress lines FFmpeg spams. */
+    86→    86→function shouldLogLine(line: string): boolean {
+    87→    87→  const t = line.trim();
+    88→    88→  if (!t) return false;
+    89→    89→  if (/^frame=\s*\d+/.test(t)) return false;
+    90→    90→  if (/^size=\s*\d+/.test(t)) return false;
+    91→    91→  if (/^Stream mapping:$/.test(t)) return false;
+    92→    92→  return true;
+    93→    93→}
+    94→    94→
+    95→    95→/* ------------------------------------------------------------------ */
+    96→    96→/* Component                                                           */
+    97→    97→/* ------------------------------------------------------------------ */
+    98→    98→
+    99→    99→export default function Home() {
+   100→   100→  /* ---- file / ffmpeg state ---- */
+   101→   101→  const [file, setFile] = useState<File | null>(null);
+   102→   102→  const ffmpegRef = useRef<FFmpeg | null>(null);
+   103→   103→  const [ffmpegStatus, setFfmpegStatus] = useState<FfmpegStatus>("idle");
+   104→   104→
+   105→   105→  // Write-once source: the input file is written to MEMFS a single time and
+   106→   106→  // reused across every operation. This is a major speedup for 30-min files
+   107→   107→  // (avoids re-writing hundreds of MB per export).
+   108→   108→  const inputNameRef = useRef<string>("");
+   109→   109→  const inputReadyRef = useRef<boolean>(false);
+   110→   110→  const [sourceDuration, setSourceDuration] = useState<number | null>(null);
+   111→   111→
+   112→   112→  /* ---- timeline state ---- */
+   113→   113→  const [playhead, setPlayhead] = useState(0);
+   114→   114→  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+   115→   115→
+   116→   116→  /* ---- clip form state ---- */
+   117→   117→  const [startInput, setStartInput] = useState("");
+   118→   118→  const [endInput, setEndInput] = useState("");
+   119→   119→  const [nameInput, setNameInput] = useState("");
+   120→   120→  const [clips, setClips] = useState<Clip[]>([]);
+   121→   121→  const [inputMode, setInputMode] = useState<"single" | "bulk">("single");
+   122→   122→  const [bulkInput, setBulkInput] = useState("");
+   123→   123→  const [bulkOpen, setBulkOpen] = useState(false);
+   124→   124→
+   125→   125→  /* ---- audio playback state ---- */
+   126→   126→  // Object URL for the source file — memoized so the media element
+   127→   127→  // keeps a stable src across re-renders. Revoked on file change /
+   128→   128→  // unmount to avoid leaking blobs.
+   129→   129→  // We use a <video> element (hidden) rather than <audio> because
+   130→   130→  // browsers' <audio> elements often cannot decode video containers
+   131→   131→  // (MP4) — a hidden <video> plays both audio AND video files and
+   132→   132→  // outputs just the audio track.
+   133→   133→  const mediaRef = useRef<HTMLVideoElement | null>(null);
+   134→   134→  const [playingClipId, setPlayingClipId] = useState<string | null>(null);
+   135→   135→  const [audioCurrentTime, setAudioCurrentTime] = useState(0);
+   136→   136→  const audioUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file]);
+   137→   137→  // Track the end boundary of the clip currently playing so the
+   138→   138→  // timeupdate listener knows when to stop.
+   139→   139→  const playEndRef = useRef<number>(0);
+   140→   140→
+   141→   141→  /* ---- processing state ---- */
+   142→   142→  const [busy, setBusy] = useState(false);
+   143→   143→  const [taskLabel, setTaskLabel] = useState("");
+   144→   144→  const [progress, setProgress] = useState(0);
+   145→   145→
+   146→   146→  /* ---- logs (batched) ---- */
+   147→   147→  const [logs, setLogs] = useState<LogEntry[]>([]);
+   148→   148→  const logIdRef = useRef(0);
+   149→   149→  const logBufferRef = useRef<LogEntry[]>([]);
+   150→   150→  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   151→   151→  const progressHandlerRef = useRef<(r: number) => void>(() => {});
+   152→   152→
+   153→   153→  /* ---- drag / toast ---- */
+   154→   154→  const [dragging, setDragging] = useState(false);
+   155→   155→  const [toasts, setToasts] = useState<Toast[]>([]);
+   156→   156→
+   157→   157→  /* ---- refs ---- */
+   158→   158→  const fileInputRef = useRef<HTMLInputElement>(null);
+   159→   159→  const terminalRef = useRef<HTMLDivElement>(null);
+   160→   160→
+   161→   161→  /* ---------------------------------------------------------------- */
+   162→   162→  /* Logging (batched to avoid re-rendering on every FFmpeg line)      */
+   163→   163→  /* ---------------------------------------------------------------- */
+   164→   164→  const appendLog = useCallback((text: string, type: LogType = "muted") => {
+   165→   165→    if (type === "muted" && !shouldLogLine(text)) return;
+   166→   166→    logIdRef.current += 1;
+   167→   167→    logBufferRef.current.push({ id: logIdRef.current, text, type });
+   168→   168→    if (flushTimerRef.current === null) {
+   169→   169→      flushTimerRef.current = setTimeout(() => {
+   170→   170→        const batch = logBufferRef.current;
+   171→   171→        logBufferRef.current = [];
+   172→   172→        flushTimerRef.current = null;
+   173→   173→        setLogs((prev) => [...prev, ...batch].slice(-600));
+   174→   174→      }, 90);
+   175→   175→    }
+   176→   176→  }, []);
+   177→   177→
+   178→   178→  const clearLogs = useCallback(() => {
+   179→   179→    logBufferRef.current = [];
+   180→   180→    setLogs([]);
+   181→   181→  }, []);
+   182→   182→
+   183→   183→  /* ---------------------------------------------------------------- */
+   184→   184→  /* Toasts                                                            */
+   185→   185→  /* ---------------------------------------------------------------- */
+   186→   186→  const showToast = useCallback((message: string, type: ToastType = "info") => {
+   187→   187→    const id = generateId();
+   188→   188→    setToasts((prev) => [...prev, { id, message, type }]);
+   189→   189→    setTimeout(() => {
+   190→   190→      setToasts((prev) => prev.filter((t) => t.id !== id));
+   191→   191→    }, 4200);
+   192→   192→  }, []);
+   193→   193→
+   194→   194→  /* ---------------------------------------------------------------- */
+   195→   195→  /* FFmpeg loading                                                    */
+   196→   196→  /* ---------------------------------------------------------------- */
+   197→   197→  const loadFFmpeg = useCallback(async () => {
+   198→   198→    if (ffmpegRef.current?.loaded) return ffmpegRef.current;
+   199→   199→    setFfmpegStatus("loading");
+   200→   200→    appendLog("Loading FFmpeg WebAssembly core…", "info");
+   201→   201→    try {
+   202→   202→      const ff = await createFFmpeg({
+   203→   203→        onLog: (line) => appendLog(line, "muted"),
+   204→   204→        onProgress: (r) => progressHandlerRef.current(r),
+   205→   205→      });
+   206→   206→      ffmpegRef.current = ff;
+   207→   207→      setFfmpegStatus("ready");
+   208→   208→      appendLog("FFmpeg core ready.", "success");
+   209→   209→      return ff;
+   210→   210→    } catch (e) {
+   211→   211→      setFfmpegStatus("idle");
+   212→   212→      appendLog(`Failed to load FFmpeg: ${String(e)}`, "error");
+   213→   213→      showToast(
+   214→   214→        "Could not load the FFmpeg engine. Check your connection.",
+   215→   215→        "error",
+   216→   216→      );
+   217→   217→      throw e;
+   218→   218→    }
+   219→   219→  }, [appendLog, showToast]);
+   220→   220→
+   221→   221→  const ensureFFmpeg = useCallback(async () => {
+   222→   222→    if (ffmpegRef.current?.loaded) return ffmpegRef.current;
+   223→   223→    return loadFFmpeg();
+   224→   224→  }, [loadFFmpeg]);
+   225→   225→
+   226→   226→  /* ---------------------------------------------------------------- */
+   227→   227→  /* Source file MEMFS management (write-once)                         */
+   228→   228→  /* ---------------------------------------------------------------- */
+   229→   229→  const prepareSource = useCallback(
+   230→   230→    async (ff: FFmpeg, f: File): Promise<string> => {
+   231→   231→      if (inputReadyRef.current && inputNameRef.current) {
+   232→   232→        return inputNameRef.current;
+   233→   233→      }
+   234→   234→      const ext = getExtension(f.name);
+   235→   235→      const name = `input.${ext}`;
+   236→   236→      appendLog(`Writing source file to FFmpeg in-memory FS…`, "info");
+   237→   237→      await ff.writeFile(name, await fetchFile(f));
+   238→   238→      inputNameRef.current = name;
+   239→   239→      inputReadyRef.current = true;
+   240→   240→      return name;
+   241→   241→    },
+   242→   242→    [appendLog],
+   243→   243→  );
+   244→   244→
+   245→   245→  const cleanupSource = useCallback(async () => {
+   246→   246→    const ff = ffmpegRef.current;
+   247→   247→    if (ff && inputReadyRef.current && inputNameRef.current) {
+   248→   248→      try {
+   249→   249→        await ff.deleteFile(inputNameRef.current);
+   250→   250→      } catch {
+   251→   251→        /* ignore — file may already be gone */
+   252→   252→      }
+   253→   253→    }
+   254→   254→    inputNameRef.current = "";
+   255→   255→    inputReadyRef.current = false;
+   256→   256→  }, []);
+   257→   257→
+   258→   258→  const detectDuration = useCallback(
+   259→   259→    async (ff: FFmpeg, inputName: string) => {
+   260→   260→      appendLog("Probing source duration…", "info");
+   261→   261→      const dur = await getSourceDuration(ff, inputName);
+   262→   262→      setSourceDuration(dur);
+   263→   263→      if (dur) {
+   264→   264→        appendLog(`Source duration: ${formatTimeShort(dur, true)}`, "success");
+   265→   265→      } else {
+   266→   266→        appendLog(
+   267→   267→          "Could not auto-detect duration; timeline will use clip extents.",
+   268→   268→          "warn",
+   269→   269→        );
+   270→   270→      }
+   271→   271→    },
+   272→   272→    [appendLog],
+   273→   273→  );
+   274→   274→
+   275→   275→  /* ---------------------------------------------------------------- */
+   276→   276→  /* File handling                                                     */
+   277→   277→  /* ---------------------------------------------------------------- */
+   278→   278→  const handleFileSelect = useCallback(
+   279→   279→    async (f: File) => {
+   280→   280→      // Clear any previously-written source from MEMFS.
+   281→   281→      await cleanupSource();
+   282→   282→      setFile(f);
+   283→   283→      setClips([]);
+   284→   284→      setStartInput("");
+   285→   285→      setEndInput("");
+   286→   286→      setNameInput("");
+   287→   287→      setPlayhead(0);
+   288→   288→      setSelectedClipId(null);
+   289→   289→      setSourceDuration(null);
+   290→   290→      setProgress(0);
+   291→   291→      setTaskLabel("");
+   292→   292→      appendLog(`Loaded "${f.name}" — ${formatBytes(f.size)}`, "info");
+   293→   293→      try {
+   294→   294→        const ff = await ensureFFmpeg();
+   295→   295→        const name = await prepareSource(ff, f);
+   296→   296→        await detectDuration(ff, name);
+   297→   297→      } catch {
+   298→   298→        // errors already logged / toasted
+   299→   299→      }
+   300→   300→    },
+   301→   301→    [cleanupSource, ensureFFmpeg, prepareSource, detectDuration, appendLog],
+   302→   302→  );
+   303→   303→
+   304→   304→  /** Stop all audio playback. Defined early so clearFile can use it. */
+   305→   305→  const stopPlayback = useCallback(() => {
+   306→   306→    const audio = mediaRef.current;
+   307→   307→    if (audio) {
+   308→   308→      audio.pause();
+   309→   309→      audio.currentTime = 0;
+   310→   310→    }
+   311→   311→    setPlayingClipId(null);
+   312→   312→  }, []);
+   313→   313→
+   314→   314→  const clearFile = useCallback(async () => {
+   315→   315→    await cleanupSource();
+   316→   316→    stopPlayback();
+   317→   317→    setFile(null);
+   318→   318→    setClips([]);
+   319→   319→    setStartInput("");
+   320→   320→    setEndInput("");
+   321→   321→    setNameInput("");
+   322→   322→    setBulkInput("");
+   323→   323→    setProgress(0);
+   324→   324→    setTaskLabel("");
+   325→   325→    setPlayhead(0);
+   326→   326→    setSelectedClipId(null);
+   327→   327→    setSourceDuration(null);
+   328→   328→  }, [cleanupSource, stopPlayback]);
+   329→   329→
+   330→   330→  const onFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+   331→   331→    const f = e.target.files?.[0];
+   332→   332→    if (f) void handleFileSelect(f);
+   333→   333→    e.target.value = "";
+   334→   334→  };
+   335→   335→
+   336→   336→  const handleDrop = (e: React.DragEvent) => {
+   337→   337→    e.preventDefault();
+   338→   338→    setDragging(false);
+   339→   339→    const f = e.dataTransfer.files?.[0];
+   340→   340→    if (f) void handleFileSelect(f);
+   341→   341→  };
+   342→   342→
+   343→   343→  const handleDragOver = (e: React.DragEvent) => {
+   344→   344→    e.preventDefault();
+   345→   345→    if (!dragging) setDragging(true);
+   346→   346→  };
+   347→   347→
+   348→   348→  const handleDragLeave = (e: React.DragEvent) => {
+   349→   349→    e.preventDefault();
+   350→   350→    setDragging(false);
+   351→   351→  };
+   352→   352→
+   353→   353→  /* ---------------------------------------------------------------- */
+   354→   354→  /* Playhead (clamped to effective duration)                          */
+   355→   355→  /* ---------------------------------------------------------------- */
+   356→   356→  const handlePlayheadChange = useCallback(
+   357→   357→    (time: number) => {
+   358→   358→      const maxClipEnd = clips.reduce((m, c) => Math.max(m, c.endSec), 0);
+   359→   359→      const max = sourceDuration ?? Math.max(30, maxClipEnd + 10);
+   360→   360→      setPlayhead(Math.max(0, Math.min(max, time)));
+   361→   361→    },
+   362→   362→    [sourceDuration, clips],
+   363→   363→  );
+   364→   364→
+   365→   365→  /* ---------------------------------------------------------------- */
+   366→   366→  /* Clip management                                                   */
+   367→   367→  /* ---------------------------------------------------------------- */
+   368→   368→  const addClip = () => {
+   369→   369→    let start: number;
+   370→   370→    let end: number;
+   371→   371→    try {
+   372→   372→      start = parseTimestamp(startInput);
+   373→   373→    } catch (e) {
+   374→   374→      showToast(
+   375→   375→        `Start time: ${e instanceof Error ? e.message : String(e)}`,
+   376→   376→        "error",
+   377→   377→      );
+   378→   378→      return;
+   379→   379→    }
+   380→   380→    try {
+   381→   381→      end = parseTimestamp(endInput);
+   382→   382→    } catch (e) {
+   383→   383→      showToast(
+   384→   384→        `End time: ${e instanceof Error ? e.message : String(e)}`,
+   385→   385→        "error",
+   386→   386→      );
+   387→   387→      return;
+   388→   388→    }
+   389→   389→    if (end <= start) {
+   390→   390→      showToast("End time must be later than start time.", "error");
+   391→   391→      return;
+   392→   392→    }
+   393→   393→    const name = sanitizeFilename(
+   394→   394→      nameInput.trim() || `clip_${clips.length + 1}`,
+   395→   395→    );
+   396→   396→    const newClip: Clip = {
+   397→   397→      id: generateId(),
+   398→   398→      startSec: start,
+   399→   399→      endSec: end,
+   400→   400→      startRaw: startInput.trim(),
+   401→   401→      endRaw: endInput.trim(),
+   402→   402→      filename: name,
+   403→   403→    };
+   404→   404→    setClips((prev) => [...prev, newClip]);
+   405→   405→    setSelectedClipId(newClip.id);
+   406→   406→    setStartInput("");
+   407→   407→    setEndInput("");
+   408→   408→    setNameInput("");
+   409→   409→    showToast(
+   410→   410→      `Added clip "${name}" (${formatDurationMs(end - start)})`,
+   411→   411→      "info",
+   412→   412→    );
+   413→   413→  };
+   414→   414→
+   415→   415→  /** Parse the bulk textarea and append all valid clips at once. */
+   416→   416→  const addBulkClips = () => {
+   417→   417→    if (!bulkInput.trim()) {
+   418→   418→      showToast("Paste at least one line of timestamps first.", "error");
+   419→   419→      return;
+   420→   420→    }
+   421→   421→    const { clips: parsed, errors } = parseBulkTimestamps(
+   422→   422→      bulkInput,
+   423→   423→      clips.length,
+   424→   424→    );
+   425→   425→    if (parsed.length === 0) {
+   426→   426→      showToast(
+   427→   427→        errors[0]
+   428→   428→          ? `Line ${errors[0].line}: ${errors[0].reason}`
+   429→   429→          : "No valid clips found.",
+   430→   430→        "error",
+   431→   431→      );
+   432→   432→      return;
+   433→   433→    }
+   434→   434→    const newClips: Clip[] = parsed.map((p) => ({
+   435→   435→      id: generateId(),
+   436→   436→      startSec: p.startSec,
+   437→   437→      endSec: p.endSec,
+   438→   438→      startRaw: p.startRaw,
+   439→   439→      endRaw: p.endRaw,
+   440→   440→      filename: sanitizeFilename(p.name),
+   441→   441→    }));
+   442→   442→    setClips((prev) => [...prev, ...newClips]);
+   443→   443→    setSelectedClipId(newClips[0].id);
+   444→   444→    setBulkInput("");
+   445→   445→    setBulkOpen(false);
+   446→   446→    if (errors.length === 0) {
+   447→   447→      showToast(
+   448→   448→        `Added ${newClips.length} clip${newClips.length === 1 ? "" : "s"} from bulk input`,
+   449→   449→        "success",
+   450→   450→      );
+   451→   451→    } else {
+   452→   452→      showToast(
+   453→   453→        `Added ${newClips.length} clip${newClips.length === 1 ? "" : "s"} · ${errors.length} line${errors.length === 1 ? "" : "s"} skipped`,
+   454→   454→        "info",
+   455→   455→      );
+   456→   456→    }
+   457→   457→  };
+   458→   458→
+   459→   459→  /* ---------------------------------------------------------------- */
+   460→   460→  /* Audio playback (verify clips before downloading)                  */
+   461→   461→  /* ---------------------------------------------------------------- */
+   462→   462→
+   463→   463→  /** Play a clip's audio range from start to end. Toggles off if active. */
+   464→   464→  const playClip = useCallback(
+   465→   465→    (clip: Clip) => {
+   466→   466→      const audio = mediaRef.current;
+   467→   467→      if (!audio) return;
+   468→   468→      // If this clip is already playing, toggle to pause.
+   469→   469→      if (playingClipId === clip.id && !audio.paused) {
+   470→   470→        audio.pause();
+   471→   471→        setPlayingClipId(null);
+   472→   472→        return;
+   473→   473→      }
+   474→   474→      playEndRef.current = clip.endSec;
+   475→   475→      setPlayingClipId(clip.id);
+   476→   476→      // Seek to clip start. If metadata isn't loaded yet, wait for the
+   477→   477→      // loadedmetadata event before seeking + playing.
+   478→   478→      const startPlayback = () => {
+   479→   479→        try {
+   480→   480→          audio.currentTime = clip.startSec;
+   481→   481→        } catch {
+   482→   482→          /* ignore seek errors */
+   483→   483→        }
+   484→   484→        audio.play().catch(() => {
+   485→   485→          showToast("Could not play audio for this file.", "error");
+   486→   486→          setPlayingClipId(null);
+   487→   487→        });
+   488→   488→      };
+   489→   489→      if (audio.readyState >= 1) {
+   490→   490→        startPlayback();
+   491→   491→      } else {
+   492→   492→        audio.addEventListener(
+   493→   493→          "loadedmetadata",
+   494→   494→          startPlayback,
+   495→   495→          { once: true },
+   496→   496→        );
+   497→   497→      }
+   498→   498→    },
+   499→   499→    [playingClipId, showToast],
+   500→   500→  );
+   501→   501→
+   502→   502→  // Keep audio element's src in sync with the object URL.
+   503→   503→  useEffect(() => {
+   504→   504→    const audio = mediaRef.current;
+   505→   505→    if (!audio) return;
+   506→   506→    if (audioUrl) audio.src = audioUrl;
+   507→   507→  }, [audioUrl]);
+   508→   508→
+   509→   509→  // Revoke the object URL when the file changes or component unmounts.
+   510→   510→  useEffect(() => {
+   511→   511→    return () => {
+   512→   512→      if (audioUrl) URL.revokeObjectURL(audioUrl);
+   513→   513→    };
+   514→   514→  }, [audioUrl]);
+   515→   515→
+   516→   516→  // timeupdate listener: track progress + auto-stop at clip end.
+   517→   517→  useEffect(() => {
+   518→   518→    const audio = mediaRef.current;
+   519→   519→    if (!audio) return;
+   520→   520→    const onTime = () => {
+   521→   521→      setAudioCurrentTime(audio.currentTime);
+   522→   522→      if (playEndRef.current && audio.currentTime >= playEndRef.current) {
+   523→   523→        audio.pause();
+   524→   524→        setPlayingClipId(null);
+   525→   525→        playEndRef.current = 0;
+   526→   526→      }
+   527→   527→    };
+   528→   528→    const onEnded = () => {
+   529→   529→      setPlayingClipId(null);
+   530→   530→      playEndRef.current = 0;
+   531→   531→    };
+   532→   532→    audio.addEventListener("timeupdate", onTime);
+   533→   533→    audio.addEventListener("ended", onEnded);
+   534→   534→    return () => {
+   535→   535→      audio.removeEventListener("timeupdate", onTime);
+   536→   536→      audio.removeEventListener("ended", onEnded);
+   537→   537→    };
+   538→   538→  }, []);
+   539→   539→
+   540→   540→  const removeClip = (id: string) => {
+   541→   541→    setClips((prev) => prev.filter((c) => c.id !== id));
+   542→   542→    setSelectedClipId((prev) => (prev === id ? null : prev));
+   543→   543→    if (playingClipId === id) stopPlayback();
+   544→   544→  };
+   545→   545→
+   546→   546→  const deleteClip = useCallback(
+   547→   547→    (id: string) => {
+   548→   548→      setClips((prev) => {
+   549→   549→        const target = prev.find((c) => c.id === id);
+   550→   550→        if (target) {
+   551→   551→          showToast(`Deleted clip "${target.filename}"`, "info");
+   552→   552→        }
+   553→   553→        return prev.filter((c) => c.id !== id);
+   554→   554→      });
+   555→   555→      setSelectedClipId((prev) => (prev === id ? null : prev));
+   556→   556→      if (playingClipId === id) stopPlayback();
+   557→   557→    },
+   558→   558→    [showToast, playingClipId, stopPlayback],
+   559→   559→  );
+   560→   560→
+   561→   561→  /** Split the clip under the playhead into two clips at the playhead position. */
+   562→   562→  const splitAtPlayhead = useCallback(() => {
+   563→   563→    if (clips.length === 0 || busy) return;
+   564→   564→    const clip = clips.find(
+   565→   565→      (c) => playhead > c.startSec + 0.001 && playhead < c.endSec - 0.001,
+   566→   566→    );
+   567→   567→    if (!clip) {
+   568→   568→      showToast(
+   569→   569→        "Position the playhead inside a clip to split it.",
+   570→   570→        "info",
+   571→   571→      );
+   572→   572→      return;
+   573→   573→    }
+   574→   574→    const left: Clip = {
+   575→   575→      ...clip,
+   576→   576→      endSec: playhead,
+   577→   577→      endRaw: formatTime(playhead, true),
+   578→   578→      filename: `${clip.filename}_A`,
+   579→   579→    };
+   580→   580→    const right: Clip = {
+   581→   581→      ...clip,
+   582→   582→      id: generateId(),
+   583→   583→      startSec: playhead,
+   584→   584→      startRaw: formatTime(playhead, true),
+   585→   585→      filename: `${clip.filename}_B`,
+   586→   586→    };
+   587→   587→    setClips((prev) =>
+   588→   588→      prev.flatMap((c) => (c.id === clip.id ? [left, right] : [c])),
+   589→   589→    );
+   590→   590→    setSelectedClipId(right.id);
+   591→   591→    showToast(
+   592→   592→      `Split "${clip.filename}" → "${left.filename}" + "${right.filename}" at ${formatTimeShort(playhead, true)}`,
+   593→   593→      "success",
+   594→   594→    );
+   595→   595→  }, [clips, playhead, busy, showToast]);
+   596→   596→
+   597→   597→  /* ---------------------------------------------------------------- */
+   598→   598→  /* Operation: MP4 → MP3                                              */
+   599→   599→  /* ---------------------------------------------------------------- */
+   600→   600→  const extractMp3 = async () => {
+   601→   601→    if (!file || busy) return;
+   602→   602→    setBusy(true);
+   603→   603→    setTaskLabel("Extracting audio → 192 kbps MP3");
+   604→   604→    setProgress(0);
+   605→   605→    const outputName = "output.mp3";
+   606→   606→    try {
+   607→   607→      const ff = await ensureFFmpeg();
+   608→   608→      const inputName = await prepareSource(ff, file);
+   609→   609→
+   610→   610→      progressHandlerRef.current = (r) => setProgress(r);
+   611→   611→      appendLog("Encoding audio with libmp3lame @ 192 kbps…", "info");
+   612→   612→      await ff.exec(buildMp3Args(inputName, outputName));
+   613→   613→
+   614→   614→      const data = (await ff.readFile(outputName)) as Uint8Array;
+   615→   615→      const baseName = sanitizeFilename(stripExtension(file.name));
+   616→   616→      const outName = `${baseName}.mp3`;
+   617→   617→      downloadBlob(new Blob([data], { type: "audio/mpeg" }), outName);
+   618→   618→      appendLog(
+   619→   619→        `✓ Done — downloaded ${outName} (${formatBytes(data.byteLength)})`,
+   620→   620→        "success",
+   621→   621→      );
+   622→   622→      showToast(`MP3 extracted → ${outName}`, "success");
+   623→   623→    } catch (e) {
+   624→   624→      const msg = e instanceof Error ? e.message : String(e);
+   625→   625→      appendLog(`✗ MP3 extraction failed: ${msg}`, "error");
+   626→   626→      showToast(`MP3 extraction failed: ${msg}`, "error");
+   627→   627→    } finally {
+   628→   628→      const ff = ffmpegRef.current;
+   629→   629→      if (ff) {
+   630→   630→        try {
+   631→   631→          await ff.deleteFile(outputName);
+   632→   632→        } catch {
+   633→   633→          /* ignore */
+   634→   634→        }
+   635→   635→      }
+   636→   636→      // NOTE: input file intentionally stays in MEMFS for reuse.
+   637→   637→      setBusy(false);
+   638→   638→      setProgress(0);
+   639→   639→      setTaskLabel("");
+   640→   640→      progressHandlerRef.current = () => {};
+   641→   641→    }
+   642→   642→  };
+   643→   643→
+   644→   644→  /* ---------------------------------------------------------------- */
+   645→   645→  /* Operation: Export separate clips                                  */
+   646→   646→  /* ---------------------------------------------------------------- */
+   647→   647→  const exportSeparate = async () => {
+   648→   648→    if (!file || clips.length === 0 || busy) return;
+   649→   649→    setBusy(true);
+   650→   650→    setTaskLabel("Cutting & downloading separate clips");
+   651→   651→    setProgress(0);
+   652→   652→    const segNames: string[] = [];
+   653→   653→    try {
+   654→   654→      const ff = await ensureFFmpeg();
+   655→   655→      const inputName = await prepareSource(ff, file);
+   656→   656→
+   657→   657→      for (let i = 0; i < clips.length; i++) {
+   658→   658→        const clip = clips[i];
+   659→   659→        const segName = `seg_${i}.mp4`;
+   660→   660→        segNames.push(segName);
+   661→   661→        const duration = clip.endSec - clip.startSec;
+   662→   662→        const outName = `${sanitizeFilename(clip.filename)}.mp4`;
+   663→   663→
+   664→   664→        appendLog(
+   665→   665→          `[${i + 1}/${clips.length}] Cutting "${outName}" — ${formatTime(clip.startSec, true)} → ${formatTime(clip.endSec, true)} (${formatDurationMs(duration)})`,
+   666→   666→          "info",
+   667→   667→        );
+   668→   668→        const idx = i;
+   669→   669→        progressHandlerRef.current = (r) =>
+   670→   670→          setProgress((idx + r) / clips.length);
+   671→   671→        await ff.exec(
+   672→   672→          buildCutArgs(inputName, segName, clip.startSec, duration),
+   673→   673→        );
+   674→   674→
+   675→   675→        const data = (await ff.readFile(segName)) as Uint8Array;
+   676→   676→        downloadBlob(new Blob([data], { type: "video/mp4" }), outName);
+   677→   677→        appendLog(
+   678→   678→          `  ✓ Downloaded ${outName} (${formatBytes(data.byteLength)})`,
+   679→   679→          "success",
+   680→   680→        );
+   681→   681→
+   682→   682→        // Free the MEMFS entry so memory stays bounded for 30-min sources.
+   683→   683→        try {
+   684→   684→          await ff.deleteFile(segName);
+   685→   685→        } catch {
+   686→   686→          /* ignore */
+   687→   687→        }
+   688→   688→        segNames.pop();
+   689→   689→
+   690→   690→        // Brief pause so browsers don't block multi-file downloads.
+   691→   691→        await sleep(450);
+   692→   692→      }
+   693→   693→
+   694→   694→      appendLog(`✓ All ${clips.length} clips downloaded.`, "success");
+   695→   695→      showToast(`${clips.length} clips downloaded`, "success");
+   696→   696→    } catch (e) {
+   697→   697→      const msg = e instanceof Error ? e.message : String(e);
+   698→   698→      appendLog(`✗ Export failed: ${msg}`, "error");
+   699→   699→      showToast(`Export failed: ${msg}`, "error");
+   700→   700→    } finally {
+   701→   701→      const ff = ffmpegRef.current;
+   702→   702→      if (ff) {
+   703→   703→        for (const n of segNames) {
+   704→   704→          try {
+   705→   705→            await ff.deleteFile(n);
+   706→   706→          } catch {
+   707→   707→            /* ignore */
+   708→   708→          }
+   709→   709→        }
+   710→   710→      }
+   711→   711→      setBusy(false);
+   712→   712→      setProgress(0);
+   713→   713→      setTaskLabel("");
+   714→   714→      progressHandlerRef.current = () => {};
+   715→   715→    }
+   716→   716→  };
+   717→   717→
+   718→   718→  /* ---------------------------------------------------------------- */
+   719→   719→  /* Operation: Export merged master file                              */
+   720→   720→  /* ---------------------------------------------------------------- */
+   721→   721→  const exportMerged = async () => {
+   722→   722→    if (!file || clips.length === 0 || busy) return;
+   723→   723→    setBusy(true);
+   724→   724→    setTaskLabel("Building merged master file");
+   725→   725→    setProgress(0);
+   726→   726→    const segNames: string[] = [];
+   727→   727→    const listName = "concat_list.txt";
+   728→   728→    const outputName = "merged.mp4";
+   729→   729→    try {
+   730→   730→      const ff = await ensureFFmpeg();
+   731→   731→      const inputName = await prepareSource(ff, file);
+   732→   732→
+   733→   733→      const total = clips.length;
+   734→   734→      // Phase 1 — cut each segment (0% → 70%)
+   735→   735→      for (let i = 0; i < total; i++) {
+   736→   736→        const clip = clips[i];
+   737→   737→        const segName = `seg_${i}.mp4`;
+   738→   738→        segNames.push(segName);
+   739→   739→        const duration = clip.endSec - clip.startSec;
+   740→   740→        appendLog(
+   741→   741→          `[${i + 1}/${total}] Cutting segment — ${formatTime(clip.startSec, true)} → ${formatTime(clip.endSec, true)}`,
+   742→   742→          "info",
+   743→   743→        );
+   744→   744→        const idx = i;
+   745→   745→        progressHandlerRef.current = (r) =>
+   746→   746→          setProgress(((idx + r) / total) * 0.7);
+   747→   747→        await ff.exec(
+   748→   748→          buildCutArgs(inputName, segName, clip.startSec, duration),
+   749→   749→        );
+   750→   750→      }
+   751→   751→
+   752→   752→      // Phase 2 — build the virtual concat list (FFmpeg text file)
+   753→   753→      appendLog("Generating concat demuxer list.txt…", "info");
+   754→   754→      await ff.writeFile(listName, buildConcatList(segNames));
+   755→   755→
+   756→   756→      // Phase 3 — stitch with stream copy (instant for same-codec segments)
+   757→   757→      appendLog("Stitching via concat demuxer + stream copy…", "info");
+   758→   758→      progressHandlerRef.current = () => setProgress(0.72);
+   759→   759→      let mergedOk = false;
+   760→   760→      try {
+   761→   761→        await ff.exec(buildConcatCopyArgs(listName, outputName));
+   762→   762→        mergedOk = true;
+   763→   763→      } catch (e) {
+   764→   764→        appendLog(
+   765→   765→          `Stream-copy concat failed (${e instanceof Error ? e.message : String(e)}); falling back to concat filter re-encode…`,
+   766→   766→          "warn",
+   767→   767→        );
+   768→   768→        try {
+   769→   769→          await ff.deleteFile(outputName);
+   770→   770→        } catch {
+   771→   771→          /* ignore */
+   772→   772→        }
+   773→   773→        progressHandlerRef.current = (r) => setProgress(0.72 + r * 0.26);
+   774→   774→        await ff.exec(buildConcatReencodeArgs(segNames, outputName));
+   775→   775→        mergedOk = true;
+   776→   776→      }
+   777→   777→
+   778→   778→      if (mergedOk) {
+   779→   779→        progressHandlerRef.current = () => setProgress(0.98);
+   780→   780→        const data = (await ff.readFile(outputName)) as Uint8Array;
+   781→   781→        const outName = "merged_master.mp4";
+   782→   782→        downloadBlob(new Blob([data], { type: "video/mp4" }), outName);
+   783→   783→        appendLog(
+   784→   784→          `✓ Merged master downloaded — ${outName} (${formatBytes(data.byteLength)})`,
+   785→   785→          "success",
+   786→   786→        );
+   787→   787→        showToast(`Merged master file downloaded`, "success");
+   788→   788→      }
+   789→   789→    } catch (e) {
+   790→   790→      const msg = e instanceof Error ? e.message : String(e);
+   791→   791→      appendLog(`✗ Merge failed: ${msg}`, "error");
+   792→   792→      showToast(`Merge failed: ${msg}`, "error");
+   793→   793→    } finally {
+   794→   794→      const ff = ffmpegRef.current;
+   795→   795→      if (ff) {
+   796→   796→        for (const n of segNames) {
+   797→   797→          try {
+   798→   798→            await ff.deleteFile(n);
+   799→   799→          } catch {
+   800→   800→            /* ignore */
+   801→   801→          }
+   802→   802→        }
+   803→   803→        try {
+   804→   804→          await ff.deleteFile(listName);
+   805→   805→        } catch {
+   806→   806→          /* ignore */
+   807→   807→        }
+   808→   808→        try {
+   809→   809→          await ff.deleteFile(outputName);
+   810→   810→        } catch {
+   811→   811→          /* ignore */
+   812→   812→        }
+   813→   813→      }
+   814→   814→      setBusy(false);
+   815→   815→      setProgress(0);
+   816→   816→      setTaskLabel("");
+   817→   817→      progressHandlerRef.current = () => {};
+   818→   818→    }
+   819→   819→  };
+   820→   820→
+   821→   821→  /* ---------------------------------------------------------------- */
+   822→   822→  /* Auto-scroll terminal to bottom on new logs                        */
+   823→   823→  /* ---------------------------------------------------------------- */
+   824→   824→  useEffect(() => {
+   825→   825→    if (terminalRef.current) {
+   826→   826→      terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+   827→   827→    }
+   828→   828→  }, [logs]);
+   829→   829→
+   830→   830→  /* ---------------------------------------------------------------- */
+   831→   831→  /* Cleanup MEMFS on unmount                                          */
+   832→   832→  /* ---------------------------------------------------------------- */
+   833→   833→  useEffect(() => {
+   834→   834→    return () => {
+   835→   835→      const ff = ffmpegRef.current;
+   836→   836→      if (ff && inputReadyRef.current && inputNameRef.current) {
+   837→   837→        try {
+   838→   838→          void ff.deleteFile(inputNameRef.current);
+   839→   839→        } catch {
+   840→   840→          /* ignore */
+   841→   841→        }
+   842→   842→      }
+   843→   843→    };
+   844→   844→  }, []);
+   845→   845→
+   846→   846→  /* ---------------------------------------------------------------- */
+   847→   847→  /* Derived display values                                            */
+   848→   848→  /* ---------------------------------------------------------------- */
+   849→   849→  const statusDotClass =
+   850→   850→    ffmpegStatus === "ready"
+   851→   851→      ? "ready"
+   852→   852→      : ffmpegStatus === "loading"
+   853→   853→        ? "loading"
+   854→   854→        : busy
+   855→   855→          ? "busy"
+   856→   856→          : "";
+   857→   857→  const statusText =
+   858→   858→    ffmpegStatus === "ready"
+   859→   859→      ? "Engine ready"
+   860→   860→      : ffmpegStatus === "loading"
+   861→   861→        ? "Loading engine…"
+   862→   862→        : busy
+   863→   863→          ? "Processing…"
+   864→   864→          : "Engine idle";
+   865→   865→
+   866→   866→  const ext = file ? getExtension(file.name) : "";
+   867→   867→
+   868→   868→  /* ---------------------------------------------------------------- */
+   869→   869→  /* Render                                                            */
+   870→   870→  /* ---------------------------------------------------------------- */
+   871→   871→  return (
+   872→   872→    <div className="editor-shell">
+   873→   873→      {/* ===== Header ===== */}
+   874→   874→      <header className="editor-header">
+   875→   875→        <div className="editor-brand">
+   876→   876→          <div className="editor-logo" aria-hidden="true">
+   877→   877→            <Clapperboard size={22} color="#fff" strokeWidth={2.2} />
+   878→   878→          </div>
+   879→   879→          <div>
+   880→   880→            <h1 className="editor-title">ClipForge</h1>
+   881→   881→            <p className="editor-subtitle">
+   882→   882→              Client-side Audio / Video Editor
+   883→   883→            </p>
+   884→   884→          </div>
+   885→   885→        </div>
+   886→   886→        <div className="editor-status" role="status" aria-live="polite">
+   887→   887→          <span className={`status-dot ${statusDotClass}`} />
+   888→   888→          <span>{statusText}</span>
+   889→   889→        </div>
+   890→   890→      </header>
+   891→   891→
+   892→   892→      {/* ===== Main ===== */}
+   893→   893→      <main className="editor-main">
+   894→   894→        {/* --- Step 1: Source file --- */}
+   895→   895→        <section className="panel" aria-labelledby="step1-title">
+   896→   896→          <div className="panel-header">
+   897→   897→            <h2 id="step1-title" className="panel-title">
+   898→   898→              <span className="step-num">1</span> Source File
+   899→   899→            </h2>
+   900→   900→            <p className="panel-desc">
+   901→   901→              Drop a video — everything runs in your browser
+   902→   902→            </p>
+   903→   903→          </div>
+   904→   904→          <div className="panel-body">
+   905→   905→            {!file ? (
+   906→   906→              <div
+   907→   907→                className={`dropzone ${dragging ? "dragging" : ""}`}
+   908→   908→                onDrop={handleDrop}
+   909→   909→                onDragOver={handleDragOver}
+   910→   910→                onDragLeave={handleDragLeave}
+   911→   911→                onClick={() => fileInputRef.current?.click()}
+   912→   912→                role="button"
+   913→   913→                tabIndex={0}
+   914→   914→                onKeyDown={(e) => {
+   915→   915→                  if (e.key === "Enter" || e.key === " ") {
+   916→   916→                    e.preventDefault();
+   917→   917→                    fileInputRef.current?.click();
+   918→   918→                  }
+   919→   919→                }}
+   920→   920→              >
+   921→   921→                <input
+   922→   922→                  ref={fileInputRef}
+   923→   923→                  type="file"
+   924→   924→                  accept="video/*,audio/*"
+   925→   925→                  onChange={onFileInputChange}
+   926→   926→                  hidden
+   927→   927→                />
+   928→   928→                <div className="dropzone-icon" aria-hidden="true">
+   929→   929→                  <UploadCloud size={28} />
+   930→   930→                </div>
+   931→   931→                <div className="dropzone-text">
+   932→   932→                  Drop an MP4 / video here, or click to browse
+   933→   933→                </div>
+   934→   934→                <div className="dropzone-hint">
+   935→   935→                  100% client-side · no upload · handles files up to ~30 min
+   936→   936→                </div>
+   937→   937→              </div>
+   938→   938→            ) : (
+   939→   939→              <div className="fileinfo">
+   940→   940→                <div className="fileinfo-icon" aria-hidden="true">
+   941→   941→                  <FileVideo size={22} />
+   942→   942→                </div>
+   943→   943→                <div className="fileinfo-meta">
+   944→   944→                  <div className="fileinfo-name" title={file.name}>
+   945→   945→                    {file.name}
+   946→   946→                  </div>
+   947→   947→                  <div className="fileinfo-sub">
+   948→   948→                    {formatBytes(file.size)} · {ext.toUpperCase()} ·{" "}
+   949→   949→                    {file.type || "media file"}
+   950→   950→                    {sourceDuration != null && (
+   951→   951→                      <>
+   952→   952→                        {" · "}
+   953→   953→                        <span className="mono">
+   954→   954→                          {formatTimeShort(sourceDuration, true)}
+   955→   955→                        </span>
+   956→   956→                      </>
+   957→   957→                    )}
+   958→   958→                  </div>
+   959→   959→                </div>
+   960→   960→                <div className="fileinfo-clear">
+   961→   961→                  <button
+   962→   962→                    className="btn btn-ghost"
+   963→   963→                    onClick={clearFile}
+   964→   964→                    disabled={busy}
+   965→   965→                    type="button"
+   966→   966→                  >
+   967→   967→                    <X size={15} /> Change
+   968→   968→                  </button>
+   969→   969→                </div>
+   970→   970→              </div>
+   971→   971→            )}
+   972→   972→          </div>
+   973→   973→        </section>
+   974→   974→
+   975→   975→        {/* --- Step 2: Operations dashboard --- */}
+   976→   976→        {file && (
+   977→   977→          <section className="panel" aria-labelledby="step2-title">
+   978→   978→            <div className="panel-header">
+   979→   979→              <h2 id="step2-title" className="panel-title">
+   980→   980→                <span className="step-num">2</span> Operations Dashboard
+   981→   981→              </h2>
+   982→   982→              <p className="panel-desc">
+   983→   983→                Extract full MP3 &amp; mark clip segments
+   984→   984→              </p>
+   985→   985→            </div>
+   986→   986→            <div
+   987→   987→              className="panel-body"
+   988→   988→              style={{
+   989→   989→                display: "flex",
+   990→   990→                flexDirection: "column",
+   991→   991→                gap: "1.1rem",
+   992→   992→              }}
+   993→   993→            >
+   994→   994→              {/* MP3 extraction */}
+   995→   995→              <div className="toggle-row">
+   996→   996→                <div className="toggle-info">
+   997→   997→                  <div className="toggle-title">
+   998→   998→                    <Music
+   999→   999→                      size={15}
+  1000→  1000→                      style={{
+  1001→  1001→                        display: "inline",
+  1002→  1002→                        marginRight: 6,
+  1003→  1003→                        verticalAlign: "-2px",
+  1004→  1004→                      }}
+  1005→  1005→                    />
+  1006→  1006→                    MP3 Extraction · 192 kbps
+  1007→  1007→                  </div>
+  1008→  1008→                  <div className="toggle-desc">
+  1009→  1009→                    Extract the full audio track and encode a clean 192 kbps
+  1010→  1010→                    MP3.
+  1011→  1011→                  </div>
+  1012→  1012→                </div>
+  1013→  1013→                <button
+  1014→  1014→                  className="btn btn-primary"
+  1015→  1015→                  onClick={extractMp3}
+  1016→  1016→                  disabled={busy}
+  1017→  1017→                  type="button"
+  1018→  1018→                >
+  1019→  1019→                  {busy && taskLabel.startsWith("Extracting") ? (
+  1020→  1020→                    <Loader2 size={15} className="animate-spin" />
+  1021→  1021→                  ) : (
+  1022→  1022→                    <Music size={15} />
+  1023→  1023→                  )}
+  1024→  1024→                  Extract MP3
+  1025→  1025→                </button>
+  1026→  1026→              </div>
+  1027→  1027→
+  1028→  1028→              {/* Segment timestamp form */}
+  1029→  1029→              <div>
+  1030→  1030→                <div
+  1031→  1031→                  className="row-between"
+  1032→  1032→                  style={{ marginBottom: "0.75rem", flexWrap: "wrap", gap: "0.5rem" }}
+  1033→  1033→                >
+  1034→  1034→                  <div className="row">
+  1035→  1035→                    <span className="badge">
+  1036→  1036→                      <Film
+  1037→  1037→                        size={11}
+  1038→  1038→                        style={{
+  1039→  1039→                          display: "inline",
+  1040→  1040→                          marginRight: 4,
+  1041→  1041→                          verticalAlign: "-1px",
+  1042→  1042→                        }}
+  1043→  1043→                      />
+  1044→  1044→                      Clip Segments
+  1045→  1045→                    </span>
+  1046→  1046→                    <span
+  1047→  1047→                      className="muted"
+  1048→  1048→                      style={{ fontSize: "0.78rem" }}
+  1049→  1049→                    >
+  1050→  1050→                      {clips.length} added
+  1051→  1051→                    </span>
+  1052→  1052→                  </div>
+  1053→  1053→                  {/* Single / Bulk mode toggle */}
+  1054→  1054→                  <div className="mode-toggle" role="tablist" aria-label="Input mode">
+  1055→  1055→                    <button
+  1056→  1056→                      type="button"
+  1057→  1057→                      role="tab"
+  1058→  1058→                      aria-selected={inputMode === "single"}
+  1059→  1059→                      className={`mode-toggle-btn ${inputMode === "single" ? "active" : ""}`}
+  1060→  1060→                      onClick={() => setInputMode("single")}
+  1061→  1061→                    >
+  1062→  1062→                      <Plus size={13} /> Single
+  1063→  1063→                    </button>
+  1064→  1064→                    <button
+  1065→  1065→                      type="button"
+  1066→  1066→                      role="tab"
+  1067→  1067→                      aria-selected={inputMode === "bulk"}
+  1068→  1068→                      className={`mode-toggle-btn ${inputMode === "bulk" ? "active" : ""}`}
+  1069→  1069→                      onClick={() => {
+  1070→  1070→                        setInputMode("bulk");
+  1071→  1071→                        setBulkOpen(true);
+  1072→  1072→                      }}
+  1073→  1073→                    >
+  1074→  1074→                      <ListPlus size={13} /> Bulk paste
+  1075→  1075→                    </button>
+  1076→  1076→                  </div>
+  1077→  1077→                </div>
+  1078→  1078→
+  1079→  1079→                {inputMode === "single" ? (
+  1080→  1080→                  <div className="form-grid">
+  1081→  1081→                    <div className="field">
+  1082→  1082→                      <label className="field-label" htmlFor="clip-start">
+  1083→  1083→                        Start Time
+  1084→  1084→                      </label>
+  1085→  1085→                      <input
+  1086→  1086→                        id="clip-start"
+  1087→  1087→                        className="input"
+  1088→  1088→                        placeholder="00:01:30.000"
+  1089→  1089→                        value={startInput}
+  1090→  1090→                        onChange={(e) => setStartInput(e.target.value)}
+  1091→  1091→                        onKeyDown={(e) => {
+  1092→  1092→                          if (e.key === "Enter") addClip();
+  1093→  1093→                        }}
+  1094→  1094→                        disabled={busy}
+  1095→  1095→                        inputMode="numeric"
+  1096→  1096→                      />
+  1097→  1097→                    </div>
+  1098→  1098→                    <div className="field">
+  1099→  1099→                      <label className="field-label" htmlFor="clip-end">
+  1100→  1100→                        End Time
+  1101→  1101→                      </label>
+  1102→  1102→                      <input
+  1103→  1103→                        id="clip-end"
+  1104→  1104→                        className="input"
+  1105→  1105→                        placeholder="00:02:15.500"
+  1106→  1106→                        value={endInput}
+  1107→  1107→                        onChange={(e) => setEndInput(e.target.value)}
+  1108→  1108→                        onKeyDown={(e) => {
+  1109→  1109→                          if (e.key === "Enter") addClip();
+  1110→  1110→                        }}
+  1111→  1111→                        disabled={busy}
+  1112→  1112→                        inputMode="numeric"
+  1113→  1113→                      />
+  1114→  1114→                    </div>
+  1115→  1115→                    <div className="field field--name">
+  1116→  1116→                      <label className="field-label" htmlFor="clip-name">
+  1117→  1117→                        Clip Name
+  1118→  1118→                      </label>
+  1119→  1119→                      <input
+  1120→  1120→                        id="clip-name"
+  1121→  1121→                        className="input"
+  1122→  1122→                        placeholder="intro-scene"
+  1123→  1123→                        value={nameInput}
+  1124→  1124→                        onChange={(e) => setNameInput(e.target.value)}
+  1125→  1125→                        onKeyDown={(e) => {
+  1126→  1126→                          if (e.key === "Enter") addClip();
+  1127→  1127→                        }}
+  1128→  1128→                        disabled={busy}
+  1129→  1129→                      />
+  1130→  1130→                    </div>
+  1131→  1131→                    <div className="field field--add">
+  1132→  1132→                      <button
+  1133→  1133→                        className="btn btn-primary"
+  1134→  1134→                        onClick={addClip}
+  1135→  1135→                        disabled={busy}
+  1136→  1136→                        type="button"
+  1137→  1137→                        style={{ width: "100%" }}
+  1138→  1138→                      >
+  1139→  1139→                        <Plus size={15} /> Add Clip
+  1140→  1140→                      </button>
+  1141→  1141→                    </div>
+  1142→  1142→                  </div>
+  1143→  1143→                ) : (
+  1144→  1144→                  <div className="bulk-input-wrap">
+  1145→  1145→                    <div className="bulk-input-header">
+  1146→  1146→                      <span className="muted" style={{ fontSize: "0.74rem" }}>
+  1147→  1147→                        One clip per line —{" "}
+  1148→  1148→                        <code className="inline-code">
+  1149→  1149→                          start end name
+  1150→  1150→                        </code>
+  1151→  1151→                        . Separators: space, comma, tab, dash, arrow.
+  1152→  1152→                      </span>
+  1153→  1153→                      <button
+  1154→  1154→                        type="button"
+  1155→  1155→                        className="btn btn-ghost bulk-collapse-btn"
+  1156→  1156→                        onClick={() => setBulkOpen((v) => !v)}
+  1157→  1157→                        aria-expanded={bulkOpen}
+  1158→  1158→                        title={bulkOpen ? "Hide examples" : "Show examples"}
+  1159→  1159→                      >
+  1160→  1160→                        {bulkOpen ? (
+  1161→  1161→                          <ChevronUp size={14} />
+  1162→  1162→                        ) : (
+  1163→  1163→                          <ChevronDown size={14} />
+  1164→  1164→                        )}
+  1165→  1165→                        Examples
+  1166→  1166→                      </button>
+  1167→  1167→                    </div>
+  1168→  1168→                    {bulkOpen && (
+  1169→  1169→                      <pre className="bulk-examples mono">{`# one clip per line — anything after the
+  1170→  1170→# 2nd timestamp becomes the clip name
+  1171→  1171→00:01:00 00:02:00 intro
+  1172→  1172→00:02:05.500 00:03:30 bridge
+  1173→  1173→1:30 2:15 verse-two
+  1174→  1174→00:05:00,00:06:00,outro`}</pre>
+  1175→  1175→                    )}
+  1176→  1176→                    <textarea
+  1177→  1177→                      className="bulk-textarea mono"
+  1178→  1178→                      placeholder={
+  1179→  1179→                        "00:00:01.000 00:00:04.500 intro\n00:00:05.000 00:00:09.000 main-scene\n00:00:10.000 00:00:15.500 outro"
+  1180→  1180→                      }
+  1181→  1181→                      value={bulkInput}
+  1182→  1182→                      onChange={(e) => setBulkInput(e.target.value)}
+  1183→  1183→                      disabled={busy}
+  1184→  1184→                      rows={6}
+  1185→  1185→                      spellCheck={false}
+  1186→  1186→                    />
+  1187→  1187→                    <div className="bulk-actions">
+  1188→  1188→                      <button
+  1189→  1189→                        className="btn btn-ghost"
+  1190→  1190→                        type="button"
+  1191→  1191→                        onClick={() => setBulkInput("")}
+  1192→  1192→                        disabled={busy || !bulkInput}
+  1193→  1193→                      >
+  1194→  1194→                        <Eraser size={14} /> Clear
+  1195→  1195→                      </button>
+  1196→  1196→                      <button
+  1197→  1197→                        className="btn btn-primary"
+  1198→  1198→                        type="button"
+  1199→  1199→                        onClick={addBulkClips}
+  1200→  1200→                        disabled={busy || !bulkInput.trim()}
+  1201→  1201→                      >
+  1202→  1202→                        <ListPlus size={15} /> Add all clips
+  1203→  1203→                      </button>
+  1204→  1204→                    </div>
+  1205→  1205→                  </div>
+  1206→  1206→                )}
+  1207→  1207→              </div>
+  1208→  1208→
+  1209→  1209→              {/* Clips list */}
+  1210→  1210→              <div className="clips-list">
+  1211→  1211→                {clips.length === 0 ? (
+  1212→  1212→                  <div className="empty-state">
+  1213→  1213→                    No clips yet. Add segments using the form above, or use
+  1214→  1214→                    the timeline below to split &amp; edit visually — each
+  1215→  1215→                    clip gets its own custom filename.
+  1216→  1216→                  </div>
+  1217→  1217→                ) : (
+  1218→  1218→                  <>
+  1219→  1219→                    {/* Audio transport bar — only visible while a clip is playing */}
+  1220→  1220→                    {playingClipId && (
+  1221→  1221→                      <div className="audio-transport">
+  1222→  1222→                        <button
+  1223→  1223→                          className="btn-icon audio-stop-btn"
+  1224→  1224→                          type="button"
+  1225→  1225→                          onClick={stopPlayback}
+  1226→  1226→                          aria-label="Stop playback"
+  1227→  1227→                          title="Stop"
+  1228→  1228→                        >
+  1229→  1229→                          <Square size={14} />
+  1230→  1230→                        </button>
+  1231→  1231→                        <span className="audio-transport-name">
+  1232→  1232→                          {clips.find((c) => c.id === playingClipId)?.filename ?? ""}
+  1233→  1233→                        </span>
+  1234→  1234→                        <div className="audio-progress-track">
+  1235→  1235→                          {(() => {
+  1236→  1236→                            const c = clips.find((cl) => cl.id === playingClipId);
+  1237→  1237→                            if (!c) return null;
+  1238→  1238→                            const pct = Math.max(
+  1239→  1239→                              0,
+  1240→  1240→                              Math.min(
+  1241→  1241→                                100,
+  1242→  1242→                                ((audioCurrentTime - c.startSec) /
+  1243→  1243→                                  (c.endSec - c.startSec)) *
+  1244→  1244→                                  100,
+  1245→  1245→                              ),
+  1246→  1246→                            );
+  1247→  1247→                            return (
+  1248→  1248→                              <div
+  1249→  1249→                                className="audio-progress-fill"
+  1250→  1250→                                style={{ width: `${pct}%` }}
+  1251→  1251→                              />
+  1252→  1252→                            );
+  1253→  1253→                          })()}
+  1254→  1254→                        </div>
+  1255→  1255→                        <span className="audio-transport-time mono">
+  1256→  1256→                          {formatTimeShort(
+  1257→  1257→                            Math.max(
+  1258→  1258→                              0,
+  1259→  1259→                              audioCurrentTime -
+  1260→  1260→                                (clips.find((c) => c.id === playingClipId)
+  1261→  1261→                                  ?.startSec ?? 0),
+  1262→  1262→                            ),
+  1263→  1263→                            true,
+  1264→  1264→                          )}
+  1265→  1265→                        </span>
+  1266→  1266→                      </div>
+  1267→  1267→                    )}
+  1268→  1268→                    {clips.map((clip, i) => {
+  1269→  1269→                      const isPlaying = playingClipId === clip.id;
+  1270→  1270→                      return (
+  1271→  1271→                        <div
+  1272→  1272→                          className={`clip-item ${clip.id === selectedClipId ? "selected" : ""} ${isPlaying ? "playing" : ""}`}
+  1273→  1273→                          key={clip.id}
+  1274→  1274→                          onClick={() => setSelectedClipId(clip.id)}
+  1275→  1275→                          role="button"
+  1276→  1276→                          tabIndex={0}
+  1277→  1277→                        >
+  1278→  1278→                          <div className="clip-idx">{i + 1}</div>
+  1279→  1279→                          <div
+  1280→  1280→                            className="clip-name"
+  1281→  1281→                            title={`${clip.filename}.mp4`}
+  1282→  1282→                          >
+  1283→  1283→                            {clip.filename}.mp4
+  1284→  1284→                          </div>
+  1285→  1285→                          <div className="clip-time">
+  1286→  1286→                            {formatTime(clip.startSec, true)} →{" "}
+  1287→  1287→                            {formatTime(clip.endSec, true)}
+  1288→  1288→                          </div>
+  1289→  1289→                          <div className="clip-dur">
+  1290→  1290→                            {formatDurationMs(clip.endSec - clip.startSec)}
+  1291→  1291→                          </div>
+  1292→  1292→                          <button
+  1293→  1293→                            className="btn-icon clip-play-btn"
+  1294→  1294→                            onClick={(e) => {
+  1295→  1295→                              e.stopPropagation();
+  1296→  1296→                              playClip(clip);
+  1297→  1297→                            }}
+  1298→  1298→                            disabled={busy}
+  1299→  1299→                            type="button"
+  1300→  1300→                            aria-label={
+  1301→  1301→                              isPlaying
+  1302→  1302→                                ? `Pause ${clip.filename}`
+  1303→  1303→                                : `Play ${clip.filename}`
+  1304→  1304→                            }
+  1305→  1305→                            title={isPlaying ? "Pause" : "Play audio"}
+  1306→  1306→                          >
+  1307→  1307→                            {isPlaying ? (
+  1308→  1308→                              <Pause size={16} />
+  1309→  1309→                            ) : (
+  1310→  1310→                              <Play size={16} />
+  1311→  1311→                            )}
+  1312→  1312→                          </button>
+  1313→  1313→                          <button
+  1314→  1314→                            className="btn-icon"
+  1315→  1315→                            onClick={(e) => {
+  1316→  1316→                              e.stopPropagation();
+  1317→  1317→                              removeClip(clip.id);
+  1318→  1318→                            }}
+  1319→  1319→                            disabled={busy}
+  1320→  1320→                            type="button"
+  1321→  1321→                            aria-label={`Remove clip ${clip.filename}`}
+  1322→  1322→                            title="Remove clip"
+  1323→  1323→                          >
+  1324→  1324→                            <Trash2 size={16} />
+  1325→  1325→                          </button>
+  1326→  1326→                        </div>
+  1327→  1327→                      );
+  1328→  1328→                    })}
+  1329→  1329→                  </>
+  1330→  1330→                )}
+  1331→  1331→              </div>
+  1332→  1332→            </div>
+  1333→  1333→          </section>
+  1334→  1334→        )}
+  1335→  1335→
+  1336→  1336→        {/* --- Step 3: Timeline editor --- */}
+  1337→  1337→        {file && (
+  1338→  1338→          <section className="panel" aria-labelledby="step3-title">
+  1339→  1339→            <div className="panel-header">
+  1340→  1340→              <h2 id="step3-title" className="panel-title">
+  1341→  1341→                <span className="step-num">3</span> Timeline Editor
+  1342→  1342→              </h2>
+  1343→  1343→              <p className="panel-desc">
+  1344→  1344→                Visual NLE timeline · split &amp; delete with millisecond
+  1345→  1345→                precision
+  1346→  1346→              </p>
+  1347→  1347→            </div>
+  1348→  1348→            <div className="panel-body">
+  1349→  1349→              <Timeline
+  1350→  1350→                clips={clips}
+  1351→  1351→                duration={sourceDuration}
+  1352→  1352→                selectedClipId={selectedClipId}
+  1353→  1353→                onSelectClip={setSelectedClipId}
+  1354→  1354→                playhead={playhead}
+  1355→  1355→                onPlayheadChange={handlePlayheadChange}
+  1356→  1356→                onSplitAtPlayhead={splitAtPlayhead}
+  1357→  1357→                onDeleteClip={deleteClip}
+  1358→  1358→                disabled={busy}
+  1359→  1359→              />
+  1360→  1360→            </div>
+  1361→  1361→          </section>
+  1362→  1362→        )}
+  1363→  1363→
+  1364→  1364→        {/* --- Step 4: Export panel --- */}
+  1365→  1365→        {file && clips.length > 0 && (
+  1366→  1366→          <section className="panel" aria-labelledby="step4-title">
+  1367→  1367→            <div className="panel-header">
+  1368→  1368→              <h2 id="step4-title" className="panel-title">
+  1369→  1369→                <span className="step-num">4</span> Export Pipeline
+  1370→  1370→              </h2>
+  1371→  1371→              <p className="panel-desc">
+  1372→  1372→                Optimized for 30-minute sources
+  1373→  1373→              </p>
+  1374→  1374→            </div>
+  1375→  1375→            <div className="panel-body">
+  1376→  1376→              <div className="export-grid">
+  1377→  1377→                {/* Option A */}
+  1378→  1378→                <div className="export-card">
+  1379→  1379→                  <div className="export-card-title">
+  1380→  1380→                    <Download size={16} /> Option A · Separate Clips
+  1381→  1381→                  </div>
+  1382→  1382→                  <div className="export-card-desc">
+  1383→  1383→                    Loop through the timestamp list, cut each segment from
+  1384→  1384→                    the source with stream-copy, and trigger an immediate
+  1385→  1385→                    browser download for every clip. Fast &amp;
+  1386→  1386→                    memory-friendly.
+  1387→  1387→                  </div>
+  1388→  1388→                  <button
+  1389→  1389→                    className="btn btn-primary"
+  1390→  1390→                    onClick={exportSeparate}
+  1391→  1391→                    disabled={busy}
+  1392→  1392→                    type="button"
+  1393→  1393→                  >
+  1394→  1394→                    {busy && taskLabel.startsWith("Cutting") ? (
+  1395→  1395→                      <Loader2 size={15} className="animate-spin" />
+  1396→  1396→                    ) : (
+  1397→  1397→                      <Download size={15} />
+  1398→  1398→                    )}
+  1399→  1399→                    Download Separate Clips
+  1400→  1400→                  </button>
+  1401→  1401→                </div>
+  1402→  1402→                {/* Option B */}
+  1403→  1403→                <div className="export-card">
+  1404→  1404→                  <div className="export-card-title">
+  1405→  1405→                    <Layers size={16} /> Option B · Merged Master
+  1406→  1406→                  </div>
+  1407→  1407→                  <div className="export-card-desc">
+  1408→  1408→                    Cut all segments, generate a virtual{" "}
+  1409→  1409→                    <span className="mono">concat</span> list, then stitch
+  1410→  1410→                    them with FFmpeg&apos;s concat demuxer into one
+  1411→  1411→                    continuous master file.
+  1412→  1412→                  </div>
+  1413→  1413→                  <button
+  1414→  1414→                    className="btn btn-success"
+  1415→  1415→                    onClick={exportMerged}
+  1416→  1416→                    disabled={busy}
+  1417→  1417→                    type="button"
+  1418→  1418→                  >
+  1419→  1419→                    {busy && taskLabel.startsWith("Building") ? (
+  1420→  1420→                      <Loader2 size={15} className="animate-spin" />
+  1421→  1421→                    ) : (
+  1422→  1422→                      <Layers size={15} />
+  1423→  1423→                    )}
+  1424→  1424→                    Download Merged Master File
+  1425→  1425→                  </button>
+  1426→  1426→                </div>
+  1427→  1427→              </div>
+  1428→  1428→            </div>
+  1429→  1429→          </section>
+  1430→  1430→        )}
+  1431→  1431→
+  1432→  1432→        {/* --- Processing log --- */}
+  1433→  1433→        {file && (
+  1434→  1434→          <section className="panel" aria-labelledby="log-title">
+  1435→  1435→            <div className="panel-header">
+  1436→  1436→              <h2 id="log-title" className="panel-title">
+  1437→  1437→                <TerminalSquare size={15} /> Processing Log
+  1438→  1438→              </h2>
+  1439→  1439→              <button
+  1440→  1440→                className="btn-icon"
+  1441→  1441→                onClick={clearLogs}
+  1442→  1442→                disabled={busy}
+  1443→  1443→                type="button"
+  1444→  1444→                title="Clear log"
+  1445→  1445→                aria-label="Clear log"
+  1446→  1446→              >
+  1447→  1447→                <Eraser size={15} />
+  1448→  1448→              </button>
+  1449→  1449→            </div>
+  1450→  1450→            <div className="panel-body">
+  1451→  1451→              {busy && (
+  1452→  1452→                <div className="progress-wrap">
+  1453→  1453→                  <div className="progress-track">
+  1454→  1454→                    <div
+  1455→  1455→                      className="progress-fill"
+  1456→  1456→                      style={{
+  1457→  1457→                        width: `${Math.round(progress * 100)}%`,
+  1458→  1458→                      }}
+  1459→  1459→                    />
+  1460→  1460→                  </div>
+  1461→  1461→                  <div className="progress-label">
+  1462→  1462→                    <span>{taskLabel || "Working…"}</span>
+  1463→  1463→                    <span>{Math.round(progress * 100)}%</span>
+  1464→  1464→                  </div>
+  1465→  1465→                </div>
+  1466→  1466→              )}
+  1467→  1467→              <div
+  1468→  1468→                className="terminal"
+  1469→  1469→                ref={terminalRef}
+  1470→  1470→                aria-live="polite"
+  1471→  1471→              >
+  1472→  1472→                {logs.length === 0 ? (
+  1473→  1473→                  <div className="terminal-empty">
+  1474→  1474→                    Logs will appear here once processing starts…
+  1475→  1475→                  </div>
+  1476→  1476→                ) : (
+  1477→  1477→                  logs.map((l) => (
+  1478→  1478→                    <div key={l.id} className={`terminal-line ${l.type}`}>
+  1479→  1479→                      {l.text}
+  1480→  1480→                    </div>
+  1481→  1481→                  ))
+  1482→  1482→                )}
+  1483→  1483→              </div>
+  1484→  1484→            </div>
+  1485→  1485→          </section>
+  1486→  1486→        )}
+  1487→  1487→      </main>
+  1488→  1488→
+  1489→  1489→      {/* ===== Footer ===== */}
+  1490→  1490→      <footer className="editor-footer">
+  1491→  1491→        ClipForge · Powered by{" "}
+  1492→  1492→        <a
+  1493→  1493→          href="https://ffmpegwasm.netlify.app/"
+  1494→  1494→          target="_blank"
+  1495→  1495→          rel="noopener noreferrer"
+  1496→  1496→        >
+  1497→  1497→          FFmpeg.wasm
+  1498→  1498→        </a>{" "}
+  1499→  1499→        — all processing happens locally in your browser. No file is ever
+  1500→  1500→        uploaded.
+  1501→  1501→      </footer>
+  1502→  1502→
+  1503→  1503→      {/* ===== Toasts ===== */}
+  1504→  1504→      <div className="toast-stack" aria-live="assertive">
+  1505→  1505→        {/* Hidden audio element for clip preview playback. Its src is
+  1506→  1506→            kept in sync with the uploaded file's object URL via the
+  1507→  1507→            effects above. */}
+  1508→  1508→        <video ref={mediaRef} preload="metadata" hidden />
+  1509→  1509→        {toasts.map((t) => (
+  1510→  1510→          <div
+  1511→  1511→            key={t.id}
+  1512→  1512→            className={`toast ${t.type}`}
+  1513→  1513→            onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+  1514→  1514→            role="button"
+  1515→  1515→            tabIndex={0}
+  1516→  1516→            title="Dismiss"
+  1517→  1517→          >
+  1518→  1518→            {t.type === "success" ? (
+  1519→  1519→              <CheckCircle2
+  1520→  1520→                size={17}
+  1521→  1521→                color="var(--ed-success)"
+  1522→  1522→                style={{ flexShrink: 0, marginTop: 1 }}
+  1523→  1523→              />
+  1524→  1524→            ) : t.type === "error" ? (
+  1525→  1525→              <AlertCircle
+  1526→  1526→                size={17}
+  1527→  1527→                color="var(--ed-danger)"
+  1528→  1528→                style={{ flexShrink: 0, marginTop: 1 }}
+  1529→  1529→              />
+  1530→  1530→            ) : (
+  1531→  1531→              <Info
+  1532→  1532→                size={17}
+  1533→  1533→                color="var(--ed-accent-hi)"
+  1534→  1534→                style={{ flexShrink: 0, marginTop: 1 }}
+  1535→  1535→              />
+  1536→  1536→            )}
+  1537→  1537→            <span>{t.message}</span>
+  1538→  1538→          </div>
+  1539→  1539→        ))}
+  1540→  1540→      </div>
+  1541→  1541→    </div>
+  1542→  1542→  );
+  1543→  1543→}
+  1544→  1544→
